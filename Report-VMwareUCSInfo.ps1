@@ -28,9 +28,9 @@
 .OUTPUTS
   Variable section at top of script has option for the output location of the CSV for the final report
 .NOTES
-  Version:        2.3
-  Author:         Joshua Post
-  Creation Date:  8/24/2018
+  Version:        2.4
+  Author:         Joshua Post / Jason Gersekowski
+  Creation Date:  2018/08/24 - 2021/03/23
   Purpose/Change: Modifying HostOutput for cleaner code
   Based on http://www.vmspot.com/collecting-esxi-host-hardware-information-with-powershell/
   Better UCS Profile matching based on https://timsvirtualworld.com/2014/02/report-the-running-ucs-firmware-versions-by-esxi-host-with-powerclipowertool/
@@ -49,7 +49,6 @@ $vcenters = @("vCenter.mydomain.com")
 $UCSManagers= @("192.168.1.2","ucs.mydomain.com")
 $csvfile = "C:\Temp\hostinfo.csv"
 #========================================================================
-
 
 Write-Host "Enter your vCenter Credentials"
 $vCenterAccount = Get-Credential
@@ -102,7 +101,8 @@ foreach ($vmhost in $vmhosts){
         NICModule = $Null
         FNICAdapter = $Null
         FNICModule = $Null
-        NICMAC = $Null
+		SerialNumber = $Null
+		UCSServer = $Null
         UCSServiceProfile = $Null
         UCSHardware = $Null
         UCSFirmware = $Null
@@ -114,7 +114,7 @@ foreach ($vmhost in $vmhosts){
     if ((Get-VMHost $VMHost).ConnectionState -eq "NotResponding") {
         Write-Host "$($vmhost.name) is unresponsive.  Skipping."
         Continue
-        }
+	}
 
     #Configures an EsxCli session for the host to retrieve additional information
     $esxcli = Get-VMHost $vmhost | Get-EsxCli
@@ -141,8 +141,12 @@ foreach ($vmhost in $vmhosts){
     $HostOutput.BootHBAModule = $esxcli.hardware.pci.list() | where {$_.VMkernelName -eq $HostOutput.BootHBA} | select -expandproperty ModuleName -first 1
     $HostOutput.HBADevice = Get-VMHostHba -vmhost $vmhost -device $HostOutput.BootHBA
     
-    if ($HostOutput.BootHBAModule) {$HostOutput.StorageDriver = $esxcli.system.module.get($HostOutput.BootHBAModule).version.split(",")[0].split("OEM")[0].split("-")[0].replace("Version ", "").replace("OEM","") }
-    if (!$HostOutput.StorageDriver) {$HostOutput.StorageDriver="Unknown Driver"}
+    if ($HostOutput.BootHBAModule) {
+		$HostOutput.StorageDriver = $esxcli.system.module.get($HostOutput.BootHBAModule).version.split(",")[0].split("OEM")[0].split("-")[0].replace("Version ", "").replace("OEM","")
+	}
+    if (!$HostOutput.StorageDriver) {
+		$HostOutput.StorageDriver = "Unknown Driver"
+	}
 
     #########################
     # Network NIC
@@ -157,45 +161,61 @@ foreach ($vmhost in $vmhosts){
     # Determining version of fnic for Cisco UCS
     # http://gooddatacenter.blogspot.com/2014/04/ucs-and-vmware-how-to-determine-fnic.html
     # Assuming first FibreChannel adapter is the fnic
-    $HostOutput.FNICAdapter= Get-VMHostHba -vmhost $vmhost -type FibreChannel | select -first 1
-    If ($HostOutput.FNICAdapter) { #If a FiberChannel adapter is detected
+    $HostOutput.FNICAdapter = Get-VMHostHba -vmhost $vmhost -type FibreChannel | select -first 1
+	# If a FiberChannel adapter is detected
+    If ($HostOutput.FNICAdapter) {
         $HostOutput.FNICModule = $esxcli.hardware.pci.list() | where {$_.DeviceName -eq $HostOutput.FNICAdapter.model} | select -expandproperty ModuleName -first 1 
         $HostOutput.UCSfnicDriver = $esxcli.system.module.get($HostOutput.FNICModule).version.split(",")[0].split("OEM")[0].split("-")[0].replace("Version ", "").replace("OEM","") 
-        }
+	}
 
     #########################
-    # Collect UCS Info
+    # Collect UCS Info - Match via Host Serial Numbers
     #########################
-    $HostOutput.NICMAC = Get-VMHostNetworkAdapter -vmhost $vmhost -Physical | where {$_.BitRatePerSec -gt 0} | select -expandproperty Mac -first 1 #Select first connected physical NIC
-    $HostOutput.UCSServiceProfile =  Get-UcsServiceProfile | Get-UcsVnic |  where { $_.addr -ieq  $HostOutput.NICMAC } | Get-UcsParent
+	$HostOutput.SerialNumber = $(Get-VMHostHardware -vmhost $vmHost).SerialNumber
+	$HostOutput.UCSServer = Get-UcsServer | where { $_.Serial -eq $HostOutput.SerialNumber }
+	$HostOutput.UCSServiceProfile = Get-UcsServiceProfile | where { $_.Dn -eq $HostOutput.UCSServer.AssignedToDn }
 	if (!$HostOutput.UCSServiceProfile) {
         Write-Host "Unable to retrieve UCS information for $($HostOutput.HostName)"
-        #$Report += $HostOutput
         Continue
-        }
+	}
     # Find the physical hardware the service profile is running on:
 	$HostOutput.UCSHardware = $HostOutput.UCSServiceProfile.PnDn
     # Collect UCS Firmware versions for different components
     $HostOutput.UCSFirmware = Get-UcsFirmwareRunning | Where{$_.dn -ilike "$($HostOutput.UCSHardware)/*" -and $_.Ucs -eq $HostOutput.UCSServiceProfile.Ucs}
     $HostOutput.UCScimcFirmware = $HostOutput.UCSFirmware | Where{$_.Type -eq "blade-controller" -and $_.Deployment -eq "system" -and $_.dn -ilike "$($HostOutput.UCSHardware)/*" -and $_.Ucs -eq $HostOutput.UCSServiceProfile.Ucs} | Select-Object -ExpandProperty Version
-	If (!$HostOutput.BiosVersion) {$HostOutput.BiosVersion = $HostOutput.UCSFirmware | ?{$_.Type -eq "blade-bios" -and $_.dn -ilike "$($HostOutput.UCSHardware)/*"  -and $_.Ucs -eq $HostOutput.UCSServiceProfile.Ucs} | Select-Object -ExpandProperty Version}
-	$HostOutput.UCSBoardControllerFirmware = $HostOutput.UCSFirmware | ?{$_.Type -eq "board-controller" -and $_.dn -ilike "$($HostOutput.UCSHardware)/*"  -and $_.Ucs -eq $HostOutput.UCSServiceProfile.Ucs} | Select-Object -ExpandProperty Version
+	If (!$HostOutput.BiosVersion) {
+		$HostOutput.BiosVersion = $HostOutput.UCSFirmware | ?{$_.Type -eq "blade-bios" -and $_.dn -ilike "$($HostOutput.UCSHardware)/*"  -and $_.Ucs -eq $HostOutput.UCSServiceProfile.Ucs} | Select-Object -ExpandProperty Version
+	}
+	$HostOutput.UCSBoardControllerFirmware = $HostOutput.UCSFirmware | ?{$_.Type -eq "board-controller" -and $_.dn -ilike "$($HostOutput.UCSHardware)/*" -and $_.Ucs -eq $HostOutput.UCSServiceProfile.Ucs} | Select-Object -ExpandProperty Version
 	$HostOutput.UCSserviceprofileFirmwarePolicy = $HostOutput.UCSServiceProfile | Select-Object -ExpandProperty OperHostFwPolicyName
 
 
     #########################
     # UCS Storage Adapter
     #########################
-    if($HostOutput.BootDevice.vendor -eq "Cypress" -or $bootdevice.vendor -eq "CiscoVD") {$HostOutput.StorageAdapter = Get-UcsStorageFlexFlashController | Where{$_.dn -ilike "$($HostOutput.UCSHardware)/*" -and $_.Ucs -eq $HostOutput.UCSServiceProfile.Ucs} | select -expandproperty Model -first 1}
-    else {$HostOutput.StorageAdapter = Get-UcsStorageController | Where{$_.dn -ilike "$($HostOutput.UCSHardware)/*" -and $_.Ucs -eq $HostOutput.UCSServiceProfile.Ucs} | select -expandproperty Model -first 1}
+    if($HostOutput.BootDevice.vendor -eq "Cypress" -or $bootdevice.vendor -eq "CiscoVD") {
+		$HostOutput.StorageAdapter = Get-UcsStorageFlexFlashController | Where{$_.dn -ilike "$($HostOutput.UCSHardware)/*" -and $_.Ucs -eq $HostOutput.UCSServiceProfile.Ucs} | select -expandproperty Model -first 1
+	} else {
+		$HostOutput.StorageAdapter = Get-UcsStorageController | Where{$_.dn -ilike "$($HostOutput.UCSHardware)/*" -and $_.Ucs -eq $HostOutput.UCSServiceProfile.Ucs} | select -expandproperty Model -first 1
+	}
     
     Switch ($HostOutput.StorageAdapter) {
-        "MegaRAID SAS 9240"  {$HostOutput.StorageAdapter="LSI MegaRAID SAS 9240 "; break}
-        "SAS1064E PCI-Express Fusion-MPT SAS" {$HostOutput.StorageAdapter="LSI SAS1064E"; break}
-        "FX3S" {$HostOutput.StorageAdapter="FlexFlash FX3S"; break}
-        $Null {$HostOutput.StorageAdapter=$HostOutput.BootDevice.model; break}
-        default {$HostOutput.StorageAdapter=$HostOutput.StorageAdapter; break}
-        }
+        "MegaRAID SAS 9240" {
+			$HostOutput.StorageAdapter="LSI MegaRAID SAS 9240 "
+		}
+        "SAS1064E PCI-Express Fusion-MPT SAS" {
+			$HostOutput.StorageAdapter="LSI SAS1064E"
+		}
+        "FX3S" {
+			$HostOutput.StorageAdapter="FlexFlash FX3S"
+		}
+        $Null {
+			$HostOutput.StorageAdapter=$HostOutput.BootDevice.model
+		}
+        default {
+			$HostOutput.StorageAdapter=$HostOutput.StorageAdapter
+		}
+	}
 
     #########################
     # UCS Adapter
@@ -210,9 +230,13 @@ foreach ($vmhost in $vmhosts){
     $HostOutput.UCSAdapter2Package = $HostOutput.UCSAdaptersFirmware[1].PackageVersion
     $HostOutput.UCSAdapter2Firmware = $HostOutput.UCSAdaptersFirmware[1].Version
     $HostOutput.UCSAdapter2 = $HostOutput.UCSAdapters[1] | Get-UCSCapability
-    if (($HostOutput.UCSAdapter2).count -gt 1) { $HostOutput.UCSAdapter2Model = $HostOutput.FNICAdapter.Model } #Cisco Unknown device detected
-    elseif($HostOutput.UCSAdapter2.OEMPartNumber -ne "") {$HostOutput.UCSAdapter2Model=$HostOutput.UCSAdapter2.OemPartNumber} #3rd party adapters put the model in OemPartNumber
-        else {$HostOutput.UCSAdapter2Model=$HostOutput.UCSAdapter2.name}
+    if (($HostOutput.UCSAdapter2).count -gt 1) {
+		$HostOutput.UCSAdapter2Model = $HostOutput.FNICAdapter.Model #Cisco Unknown device detected
+    } elseif($HostOutput.UCSAdapter2.OEMPartNumber -ne "") {
+		$HostOutput.UCSAdapter2Model=$HostOutput.UCSAdapter2.OemPartNumber #3rd party adapters put the model in OemPartNumber
+    } else {
+		$HostOutput.UCSAdapter2Model=$HostOutput.UCSAdapter2.name
+	}
     
     #########################
     # Output
@@ -247,7 +271,6 @@ foreach ($vmhost in $vmhosts){
     Write-Host "Board Controller Firmware:" $HostOutput.UCSboardcontrollerFirmware
     Write-Host "Service Profile Firmware Policy:" $HostOutput.UCSserviceprofileFirmwarePolicy
     Write-Host "----------------------------------"
-
 
 }
 
